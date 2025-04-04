@@ -118,13 +118,10 @@ def summarySGWR(self):
                 alpha_val = float(alpha_val) if alpha_val is not None else np.nan
 
             # ENP_j (effective number of parameters per variable)
-            try:
-                enp_j = float(np.mean(self.influ[:, i])) if self.influ is not None and i < self.influ.shape[1] else np.nan
-            except:
-                enp_j = np.nan
+            enp_j = float(self.tr_S / self.k) if self.tr_S is not None and self.k > 0 else np.nan
 
             # DoD_j (degree of dependence)
-            dod_j = float(1 - (enp_j / self.ENP)) if enp_j is not None and not np.isnan(enp_j) and self.ENP != 0 else np.nan
+            dod_j = float(1 - (enp_j / self.ENP)) if not np.isnan(enp_j) and self.ENP != 0 else np.nan
 
             # Adjusted t-value
             adj_t = float(self.critical_tval(self.adj_alpha[1])) if hasattr(self, 'adj_alpha') and len(self.adj_alpha) > 1 else np.nan
@@ -176,7 +173,10 @@ def summarySGWR(self):
     summary += "%-20s %12s %12s %12s %12s %12s\n" % ('Variable', 'Mean', 'STD', 'Min', 'Median', 'Max')
     summary += "%-20s %12s %12s %12s %12s %12s\n" % ('-' * 20, '-' * 12, '-' * 12, '-' * 12, '-' * 12, '-' * 12)
     for i in range(min(self.k, len(XNames))):
-        params_col = self.params[:, i] if i < self.params.shape[1] else np.array([np.nan])
+        if i < self.params.shape[1]:
+            params_col = self.params[:, i]
+        else:
+            params_col = np.full(self.n, np.nan)  # Use full array of nans if column missing
         summary += "%-20s %12.3f %12.3f %12.3f %12.3f %12.3f\n" % (
             XNames[i], np.mean(params_col), np.std(params_col), 
             np.min(params_col), np.median(params_col), np.max(params_col))

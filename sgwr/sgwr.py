@@ -62,12 +62,13 @@ def multi_bw(init, y, X, n, k, family, tol, max_iter, rss_score, gwr_func,
     bw_gwr = bw
     err = optim_model.resid_response.reshape((-1, 1))
     param = optim_model.params
-    if param.size == 1386:  # Special case (99 * 14)
-        param = param.reshape(n, k-1)
-        if X.shape[1] == k and k-1 == param.shape[1]:
-            param = np.hstack([np.ones((n, 1)), param])
-    elif param.shape != (n, k):
+    if param.size == n * k:
         param = param.reshape(n, k)
+    elif param.size == n:
+        param = param.reshape(n, 1)  # Untuk fit single-variable
+        param = np.hstack([np.ones((n, 1)), param]) if X.shape[1] > 1 else param
+    else:
+        raise ValueError(f"Unexpected param size: {param.size}, expected {n} or {n*k}")
     
     if verbose and (comm is None or comm.rank == 0):
         print(f"Initial param shape: {param.shape}, X shape: {X.shape}")
@@ -243,10 +244,12 @@ class ALPHA_OPT(GLM):
             predy = np.dot(X[i], betas)
             resid = self.y[i] - predy
             influ = np.dot(X[i], inv_xtx_xt[:, i])
+            print(f"i={i}, influ={influ}")
             w = 1
             
             Si = np.dot(X[i], inv_xtx_xt).reshape(-1)
             tr_STS_i = np.sum(Si * Si)
+            print(f"i={i}, tr_STS_i={tr_STS_i}")
         else:
             y = self.y.reshape(-1, 1) if len(self.y.shape) == 1 else self.y
             rslt = iwls(y, X, self.family, self.offset, None,
@@ -261,9 +264,11 @@ class ALPHA_OPT(GLM):
                 
             Si = np.dot(X[i], inv_xtx_xt).reshape(-1)
             tr_STS_i = np.sum(Si * Si * w * w)
+            print(f"i={i}, tr_STS_i={tr_STS_i}")
 
         if self.fit_params['lite']:
-            return influ.reshape(1, -1), resid, predy, betas
+            # return influ.reshape(1, -1), resid, predy, betas
+            return influ, resid, predy, betas
         else:
             Si = np.dot(X[i], inv_xtx_xt).reshape(1, -1)
             CCT = np.diag(np.dot(inv_xtx_xt, inv_xtx_xt.T)).reshape(1, -1)
@@ -312,8 +317,8 @@ class ALPHA_OPT(GLM):
         betas_ = np.array(betas_)
         if betas_.ndim == 1:
             betas_ = betas_.reshape(-1, 1)
-            
-        influ_g = self.comm.gather(np.array(influ_).reshape(-1, 1), root=0)
+        
+        influ_g = self.comm.gather(np.array(influ_), root=0)
         resid_g = self.comm.gather(np.array(resid_).reshape(-1, 1), root=0)
         predy_g = self.comm.gather(np.array(predy_).reshape(-1, 1), root=0)
         betas_g = self.comm.gather(betas_, root=0)
@@ -336,7 +341,17 @@ class ALPHA_OPT(GLM):
             else:
                 params = None
 
-            influ_lis = np.vstack(influ_g) if influ_g and influ_g[0].size > 0 else None
+            print(f"Before stacking influ_g: {influ_g}")
+            if influ_g:
+                # Flatten setiap elemen dalam influ_g sebelum concatenate
+                influ_flat = [arr.flatten() for arr in influ_g]
+                influ_lis = np.concatenate(influ_flat) if all(len(arr) > 0 for arr in influ_flat) else np.array([])
+                if len(influ_lis) != self.n:
+                    raise ValueError(f"Length of influ_lis ({len(influ_lis)}) does not match n ({self.n})")
+            else:
+                influ_lis = None
+            print(f"After stacking influ_lis (tr_S will be sum of this): {influ_lis}")
+
             resdi_lis = np.vstack(resid_g) if resid_g and resid_g[0].size > 0 else None
             predy_lis = np.vstack(predy_g) if predy_g and predy_g[0].size > 0 else None
             
@@ -358,7 +373,9 @@ class ALPHA_OPT(GLM):
                     Si_lis = None
 
                 if tr_STS_i_g and all(len(arr) > 0 for arr in tr_STS_i_g):
+                    print(f"sebelum akumulasi tr_STS_i_g: {tr_STS_i_g}")
                     tr_STS_i_lis = np.sum(np.vstack(tr_STS_i_g))
+                    print(f"setelah akumulasi tr_STS_i_lis: {tr_STS_i_lis}")
                 else:
                     tr_STS_i_lis = None
                     
@@ -523,43 +540,52 @@ class ALPHA_OPT(GLM):
         aicc = self.n * np.log(RSS / self.n) + self.n * np.log(2 * np.pi) + self.n * (self.n + trS) / (
                 self.n - trS - 2.0)
         return aicc
-
-    def fit_func(self, ini_params=None, tol=1.0e-5, max_iter=20, solve='iwls', lite=True, pool=None):
-        self.fit_params['ini_params'] = ini_params
-        self.fit_params['tol'] = tol
-        self.fit_params['max_iter'] = max_iter
-        self.fit_params['solve'] = solve
+    
+    def fit_func(self, lite=False):
         self.fit_params['lite'] = lite
-
         results = self.alpha_opt_serial()
+        influ, resid, predy, params, w, Si, tr_STS, CCT = results
+        result = SGWRResults(self, influ, resid, predy, params, w, Si, tr_STS, CCT)
+        if self.comm.rank == 0:
+            print(f"result.influ in fit_func: {result.influ}")
+        return result
+
+    # def fit_func(self, ini_params=None, tol=1.0e-5, max_iter=20, solve='iwls', lite=True, pool=None):
+    #     self.fit_params['ini_params'] = ini_params
+    #     self.fit_params['tol'] = tol
+    #     self.fit_params['max_iter'] = max_iter
+    #     self.fit_params['solve'] = solve
+    #     self.fit_params['lite'] = lite
+
+    #     results = self.alpha_opt_serial()
         
-        if lite:
-            influ_lis, resdi_lis, predy_lis, params, _, _, _, _ = results
-            return SGWRResultsLite(self, resdi_lis, influ_lis, params)
-        else:
-            influ_lis, resdi_lis, predy_lis, params, w, Si, tr_STS, CCT = results
-            return SGWRResults(self, params, predy_lis, Si, CCT, influ_lis, tr_STS, w)
+    #     if lite:
+    #         influ_lis, resdi_lis, predy_lis, params, _, _, _, _ = results
+    #         return SGWRResultsLite(self, resdi_lis, influ_lis, params)
+    #     else:
+    #         influ_lis, resdi_lis, predy_lis, params, w, Si, tr_STS, CCT = results
+    #         return SGWRResults(self, params, predy_lis, Si, CCT, influ_lis, tr_STS, w)
 
 
 class SGWRResults(GLMResults):
-    def __init__(self, model, params, predy, S, CCT, influ, tr_STS=None, w=None, opt_bws=None):
+    def __init__(self, model, influ, resid, predy, params, w=None, Si=None, tr_STS=None, CCT=None, opt_bws=None):
         GLMResults.__init__(self, model, params, predy, w)
         self.opt_bws = opt_bws if opt_bws is not None else self.model.bw
         self.offset = model.offset
         if w is not None:
             self.w = w
         self.predy = predy
-        self.S = S
+        self.S = Si
         self.tr_STS = tr_STS
         
         if influ is not None:
-            try:
-                self.influ = influ.reshape(-1, model.k)
-            except ValueError:
-                self.influ = np.tile(influ.reshape(-1, 1), (1, model.k))
+            influ = np.asarray(influ).flatten()  # Pastikan influ adalah 1D
+            if len(influ) != model.n:
+                raise ValueError(f"Length of influ ({len(influ)}) does not match n ({model.n})")
+            self.influ = influ  # Simpan sebagai 1D array
         else:
-            self.influ = None
-            
+            raise ValueError("influ cannot be None")
+        
         exog_scale = getattr(model, 'exog_scale', 1.0)
         self.CCT = self.cov_params(CCT, exog_scale)
         self._cache = {}
@@ -1121,12 +1147,14 @@ class SGWR:
             )
             self.variables = self.data.columns.tolist()
             print(f"Variables: {self.variables}, Length: {len(self.variables)}")  # Debug
+            
 
         self.data = self.comm.bcast(self.data, root=0)
         self.variables = self.comm.bcast(self.variables, root=0)
 
         self.set_search_range()
         multi_bw_min = [self.minbw] * self.k
+        # multi_bw_min = [100] * self.k
         multi_bw_max = [self.maxbw] * self.k
         opt_bws, _, _, _, _, _, _ = multi_bw(
             init=None, y=y, X=X, n=self.n, k=self.k,
@@ -1156,13 +1184,17 @@ class SGWR:
 
         final_model = ALPHA_OPT(
             self.coords, y, X, opt_bws, self.data, self.variables, self.comm, self.x_chunk, best_alphas,
-            kernel='bisquare', fixed=self.fixed, constant=self.constant, max_bw=max(opt_bws)
+            kernel='bisquare', fixed=self.fixed, constant=self.constant, max_bw=max(opt_bws), sigma2_v1=True
         )
         final_model.weight_func = lambda i: build_combined_weight(i, self.coords, opt_bws[0], self.data, self.variables, final_model.bt_value[0], self.fixed, 0)
         result = final_model.fit_func(lite=False)
         result.opt_bws = opt_bws
+            
 
         if self.comm.rank == 0:
+            print(f"result.influ: {result.influ}")
+            print(f"Calculated tr_S from result.influ: {np.sum(result.influ)}")
+            print(f"ENP: {result.ENP}, tr_S: {result.tr_S}, tr_STS: {result.tr_STS}")
             print(f"X shape: {X.shape}, len(variables): {len(self.variables)}, len(opt_bws): {len(opt_bws)}, len(best_alphas): {len(best_alphas)}")  # Debug
             print(f"Optimal Bandwidths: {opt_bws}")
             print(f"Optimal Alphas: {best_alphas}")
